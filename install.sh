@@ -10,14 +10,16 @@
 # 开不了会说明原因，不会在小鸡里面硬装一个新内核。
 #
 # 不重启，不更换别人改过的内核，不改防火墙。
-# 再运行一次是安全的：已经开好的机器只会核对开机配置。
+# 再运行一次是安全的：已经开好的机器会核对开机配置。
+# 机器上如果已经装过，再运行会先把 bbr 命令更新到新版本。
 #
 #   sh install.sh           打开 BBR
 #   sh install.sh --status  只查看
 #   sh install.sh --off     关掉本脚本打开的 BBR
 #======================================================================
 
-VERSION=1.0.0
+VERSION=1.1.0
+INSTALLED_BBR=/usr/local/sbin/bbr
 
 if [ -t 1 ]; then
   C_RED=$(printf '\033[0;31m')
@@ -65,6 +67,79 @@ version_ge() {
     i=$((i + 1))
   done
   return 0
+}
+
+# $1 比 $2 新时返回 0。相等或更旧返回 1。
+version_newer() {
+  version_ge "$1" "$2" || return 1
+  version_ge "$2" "$1" && return 1
+  return 0
+}
+
+version_from_file() {
+  [ -f "$1" ] || return 1
+  sed -n 's/^VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$1" | head -n 1
+}
+
+# 下载到的文件必须是本脚本，避免把错误页写成 bbr 命令。
+remote_script_ok() {
+  file=$1
+  [ -s "$file" ] || return 1
+  head -n 1 "$file" | grep -q '^#!/bin/sh' || return 1
+  ver=$(version_from_file "$file")
+  [ -n "$ver" ] || return 1
+  grep -q 'bbr-onekey-begin' "$file" || return 1
+  sh -n "$file" >/dev/null 2>&1
+}
+
+# keep：正在运行的就是已安装的那份。
+# replace：用这次运行的脚本盖掉已安装的文件。
+# use-installed：已安装的版本更新，不要用旧文件盖回去。
+# 还没有 bbr 命令时由调用方处理，不进这里。
+installed_copy_action() {
+  running=$1
+  installed=$2
+  same_file=$3
+  if [ "$same_file" = 1 ]; then
+    printf '%s\n' keep
+    return 0
+  fi
+  if [ -n "$installed" ] && version_newer "$installed" "$running"; then
+    printf '%s\n' use-installed
+    return 0
+  fi
+  printf '%s\n' replace
+}
+
+# $1 是当前版本，$2 是发布地址上的版本。
+remote_update_action() {
+  running=$1
+  remote=$2
+  if [ -n "$remote" ] && version_newer "$remote" "$running"; then
+    printf '%s\n' update
+    return 0
+  fi
+  printf '%s\n' stay
+}
+
+# /usr/local/sbin 不在 PATH 里时，返回一个在 PATH 里的目录，用来放 bbr 命令。
+shortcut_link_dir() {
+  path=$1
+  case ":$path:" in
+    *:/usr/local/sbin:*)
+      printf '\n'
+      return 0
+      ;;
+  esac
+  for dir in /usr/sbin /sbin /usr/bin /bin; do
+    case ":$path:" in
+      *:"$dir":*)
+        printf '%s\n' "$dir"
+        return 0
+        ;;
+    esac
+  done
+  printf '\n'
 }
 
 is_ipv4() {
@@ -144,16 +219,14 @@ network_kind() {
 }
 
 # 参数：容器类型、虚拟机类型。打印「1 名称」或「0 名称」。
-# 1 表示跟母鸡共用内核。
+# 1 表示跟母鸡共用内核。只要认出是容器，就按共用内核处理。
 classify_virt() {
   container=$1
   vm=$2
-  case $container in
-    docker|podman|lxc|lxc-libvirt|openvz|systemd-nspawn|wsl|container|rkt|crio)
-      printf '1 %s\n' "$container"
-      return 0
-      ;;
-  esac
+  if [ -n "$container" ]; then
+    printf '1 %s\n' "$container"
+    return 0
+  fi
   case $vm in
     ''|none) printf '0 none\n' ;;
     *) printf '0 %s\n' "$vm" ;;
@@ -166,7 +239,9 @@ virt_phrase() {
   case $name in
     openvz) printf '%s\n' "OpenVZ，切出来的，跟母鸡共用内核" ;;
     lxc|lxc-libvirt) printf '%s\n' "LXC，切出来的，跟母鸡共用内核" ;;
-    docker|podman|rkt|crio) printf '%s\n' "容器，跟母鸡共用内核" ;;
+    docker|podman|rkt|crio|incus|proot|pouch|cri|container-other)
+      printf '%s\n' "容器，跟母鸡共用内核"
+      ;;
     systemd-nspawn) printf '%s\n' "容器，跟母鸡共用内核" ;;
     wsl) printf '%s\n' "WSL，跟母鸡共用内核" ;;
     container) printf '%s\n' "切出来的机器，跟母鸡共用内核" ;;
@@ -634,6 +709,26 @@ show_log_tail() {
   tail -n 15 "$log" >&2 || true
 }
 
+# 打印 ok / missing / failed。rc 为 0 时是 ok。
+# 「No package」优先于「Nothing to do」，避免把找不到的包当成装好了。
+rpm_log_kind() {
+  log=$1
+  rc=$2
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' ok
+    return 0
+  fi
+  if [ -f "$log" ] && grep -q -e 'No match for argument' -e 'No matching Packages' -e 'No package' -e 'Error: Unable to find a match' "$log"; then
+    printf '%s\n' missing
+    return 0
+  fi
+  if [ -f "$log" ] && grep -q 'Nothing to do' "$log"; then
+    printf '%s\n' ok
+    return 0
+  fi
+  printf '%s\n' failed
+}
+
 # 0 装好了，1 源里没有这个包，2 装的过程失败。
 pm_install_one() {
   pkg=$1
@@ -666,15 +761,11 @@ pm_install_one() {
         yum install -y "$pkg" >"$WORKDIR/rpm.log" 2>&1
       fi
       rc=$?
-      if [ "$rc" -eq 0 ]; then
-        return 0
-      fi
-      if grep -q 'Nothing to do' "$WORKDIR/rpm.log"; then
-        return 0
-      fi
-      if grep -q -e 'No match for argument' -e 'No matching Packages' -e 'No package' -e 'Error: Unable to find a match' -e 'Nothing to do' "$WORKDIR/rpm.log"; then
-        return 1
-      fi
+      kind=$(rpm_log_kind "$WORKDIR/rpm.log" "$rc")
+      case $kind in
+        ok) return 0 ;;
+        missing) return 1 ;;
+      esac
       say_err "安装 $pkg 失败，系统原话："
       show_log_tail "$WORKDIR/rpm.log"
       return 2
@@ -1263,19 +1354,19 @@ each_sysctl_file() {
 
 persist_sysctl() {
   mkdir -p /etc/sysctl.d
+  # 先写上本脚本的配置，再改掉其它文件里的旧设置。中途失败时也不会把原来的设置删光。
+  {
+    printf '%s\n' "# 由 BBR 一键脚本 $VERSION 写入。再运行一次会覆盖本文件。"
+    printf '%s\n' "# bbr-onekey-begin"
+    printf '%s\n' "$PERSIST_BLOCK"
+    printf '%s\n' "# bbr-onekey-end"
+  } > /etc/sysctl.d/zzz-bbr.conf
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     rewrite_sysctl_file "$f" || true
   done <<EOF
 $(each_sysctl_file)
 EOF
-  DESIRED_BLOCK=$PERSIST_BLOCK
-  {
-    printf '%s\n' "# 由 BBR 一键脚本写入。再运行一次会覆盖本文件。"
-    printf '%s\n' "# bbr-onekey-begin"
-    printf '%s\n' "$PERSIST_BLOCK"
-    printf '%s\n' "# bbr-onekey-end"
-  } > /etc/sysctl.d/zzz-bbr.conf
 }
 
 clear_sysctl() {
@@ -1420,16 +1511,170 @@ apply_qdiscs() {
   CHANGED_DEVS=$(printf '%s' "$CHANGED_DEVS" | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g')
 }
 
-install_shortcut() {
-  dest=/usr/local/sbin/bbr
-  src=$0
-  [ -f "$src" ] || return 0
-  mkdir -p /usr/local/sbin 2>/dev/null || return 0
-  if [ "$src" = "$dest" ]; then
+script_path() {
+  script=$1
+  case $script in
+    /*)
+      printf '%s\n' "$script"
+      return 0
+      ;;
+  esac
+  if [ -f "$script" ]; then
+    printf '%s\n' "$(pwd)/$script"
     return 0
   fi
-  if cp "$src" "$dest" 2>/dev/null; then
-    chmod 755 "$dest" 2>/dev/null || true
+  found=$(command -v "$script" 2>/dev/null || true)
+  case $found in
+    /*) printf '%s\n' "$found" ;;
+    *) printf '%s\n' "$script" ;;
+  esac
+}
+
+place_script() {
+  src=$1
+  dest=$2
+  dir=$(dirname "$dest")
+  mkdir -p "$dir" 2>/dev/null || return 1
+  stage=$(mktemp "$dir/.bbr-new.XXXXXX") || return 1
+  if ! cp "$src" "$stage"; then
+    rm -f "$stage"
+    return 1
+  fi
+  chmod 755 "$stage" 2>/dev/null || true
+  if ! mv "$stage" "$dest"; then
+    rm -f "$stage"
+    return 1
+  fi
+  return 0
+}
+
+link_installed_shortcut() {
+  link_dir=$(shortcut_link_dir "${ORIG_PATH:-$PATH}")
+  [ -n "$link_dir" ] || return 0
+  [ -f "$INSTALLED_BBR" ] || return 0
+  [ -d "$link_dir" ] || return 0
+  if [ -e "$link_dir/bbr" ] && [ "$link_dir/bbr" -ef "$INSTALLED_BBR" ]; then
+    return 0
+  fi
+  if ln -sfn "$INSTALLED_BBR" "$link_dir/bbr" 2>/dev/null; then
+    return 0
+  fi
+  cp "$INSTALLED_BBR" "$link_dir/bbr" 2>/dev/null || true
+  chmod 755 "$link_dir/bbr" 2>/dev/null || true
+}
+
+download_install_sh() {
+  dest=$1
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    return 1
+  fi
+  for url in \
+    https://raw.githubusercontent.com/imthnio/vps-bbr/main/install.sh \
+    https://cdn.jsdelivr.net/gh/imthnio/vps-bbr@main/install.sh
+  do
+    rm -f "$dest"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --connect-timeout 5 --max-time 12 -o "$dest" "$url" 2>/dev/null || true
+    else
+      wget -qO "$dest" -T 12 "$url" 2>/dev/null || true
+    fi
+    if remote_script_ok "$dest"; then
+      return 0
+    fi
+  done
+  rm -f "$dest"
+  return 1
+}
+
+# 发布地址上有更新的脚本时，换成那一版再继续。失败不打断打开 BBR。
+maybe_take_newer_remote() {
+  [ "${BBR_UPDATED:-0}" = 1 ] && return 0
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+  dest="$WORKDIR/remote-install.sh"
+  if ! download_install_sh "$dest"; then
+    say_warn "暂时连不上脚本发布地址，按当前这份 $VERSION 继续"
+    return 0
+  fi
+  remote=$(version_from_file "$dest" || true)
+  if [ "$(remote_update_action "$VERSION" "$remote")" != update ]; then
+    return 0
+  fi
+  was_new=0
+  [ -f "$INSTALLED_BBR" ] || was_new=1
+  say_info "发现新版本 $remote（当前是 $VERSION），先换成新版本再继续"
+  if ! place_script "$dest" "$INSTALLED_BBR"; then
+    say_warn "新版本下载了，但没能写到 $INSTALLED_BBR，继续用当前这份"
+    return 0
+  fi
+  link_installed_shortcut
+  reexec_installed "$was_new" "$@"
+}
+
+reexec_installed() {
+  new_flag=$1
+  shift
+  if [ -n "${WORKDIR:-}" ]; then
+    rm -rf "$WORKDIR"
+  fi
+  trap - EXIT HUP INT TERM
+  exec env BBR_UPDATED=1 BBR_SUDO_TRIED="${BBR_SUDO_TRIED:-0}" SHORTCUT_NEW="$new_flag" \
+    sh "$INSTALLED_BBR" "$@"
+}
+
+# 把这次运行的脚本写到 bbr 命令。已安装的版本更新时不回退。
+sync_installed_script() {
+  [ "${BBR_NO_UPDATE:-0}" = 1 ] && return 0
+  maybe_take_newer_remote "$@"
+  src=$(script_path "$0")
+  [ -f "$src" ] || return 0
+  if [ ! -f "$INSTALLED_BBR" ]; then
+    if place_script "$src" "$INSTALLED_BBR"; then
+      SHORTCUT_NEW=1
+      link_installed_shortcut
+    else
+      say_warn "没能把脚本写到 $INSTALLED_BBR，这次只对当前进程生效"
+    fi
+    return 0
+  fi
+  old=$(version_from_file "$INSTALLED_BBR" || true)
+  same=0
+  if [ "$src" -ef "$INSTALLED_BBR" ]; then
+    same=1
+  fi
+  action=$(installed_copy_action "$VERSION" "$old" "$same")
+  case $action in
+    keep)
+      link_installed_shortcut
+      ;;
+    use-installed)
+      say_info "本机的 bbr 是 $old，比这次运行的 $VERSION 新，改用已安装的版本"
+      link_installed_shortcut
+      reexec_installed "${SHORTCUT_NEW:-0}" "$@"
+      ;;
+    replace)
+      if cmp -s "$src" "$INSTALLED_BBR"; then
+        link_installed_shortcut
+        return 0
+      fi
+      if ! place_script "$src" "$INSTALLED_BBR"; then
+        say_warn "没能把脚本更新到 $INSTALLED_BBR，这次只按当前这份继续"
+        return 0
+      fi
+      link_installed_shortcut
+      if [ -n "$old" ] && [ "$old" != "$VERSION" ]; then
+        say_ok "已安装的脚本已从 $old 更新到 $VERSION"
+      else
+        say_ok "已安装的脚本已更新到 $VERSION"
+      fi
+      ;;
+  esac
+}
+
+finish_shortcut_hint() {
+  link_installed_shortcut
+  if [ "${SHORTCUT_NEW:-0}" = 1 ]; then
     say_ok "以后可以直接输入 bbr，查看状态用 bbr --status"
   fi
 }
@@ -1468,6 +1713,15 @@ cmd_status() {
     say_info "开机配置：有 /etc/sysctl.d/zzz-bbr.conf"
   else
     say_info "开机配置：还没有本脚本写的文件"
+  fi
+  if [ -f "$INSTALLED_BBR" ]; then
+    inst=$(version_from_file "$INSTALLED_BBR" || true)
+    if [ -n "$inst" ]; then
+      say_info "已安装命令：$INSTALLED_BBR（$inst）"
+      if version_newer "$VERSION" "$inst"; then
+        say_info "这次运行的是 $VERSION。不带参数再运行一次，会把已安装的命令更新过去。"
+      fi
+    fi
   fi
 }
 
@@ -1566,7 +1820,7 @@ cmd_on() {
     say_info "确认可以重启时执行：reboot"
     say_info "重启后如果拥塞控制仍不是 bbr，再运行一次本脚本。"
     say_info "如果重启后内核版本完全没变，说明服务商在面板里指定了内核，需要先在面板里换成新内核。"
-    install_shortcut
+    finish_shortcut_hint
     return 0
   fi
   if [ "$LIVE_BBR" = 1 ]; then
@@ -1589,7 +1843,7 @@ cmd_on() {
     if [ "$SHARED_KERNEL" = 1 ]; then
       say_info "这台是切出来的，用的是母鸡内核里已经有的 BBR。"
     fi
-    install_shortcut
+    finish_shortcut_hint
     return 0
   fi
   say_err "没能打开 BBR。"
@@ -1605,6 +1859,7 @@ BBR 一键脚本 $VERSION
   sh install.sh --status  只查看，不修改
   sh install.sh --off     关掉本脚本打开的 BBR
 
+再运行一次会把已经装上的 bbr 命令更新到新版本，并重新核对开机配置。
 公网 VPS 和 NAT 都能用。切出来的机器如果母鸡内核带 BBR，也可以直接打开。
 EOF
 }
@@ -1619,12 +1874,13 @@ need_root() {
   fi
   if command -v sudo >/dev/null 2>&1; then
     say_info "当前不是 root，改用 sudo 继续"
-    script=$0
-    case $script in
-      /*) ;;
-      *) script=$(pwd)/$script ;;
-    esac
-    exec sudo env BBR_SUDO_TRIED=1 sh "$script" "$@"
+    script=$(script_path "$0")
+    exec sudo env \
+      BBR_SUDO_TRIED=1 \
+      BBR_NO_UPDATE="${BBR_NO_UPDATE:-0}" \
+      BBR_UPDATED="${BBR_UPDATED:-0}" \
+      SHORTCUT_NEW="${SHORTCUT_NEW:-0}" \
+      sh "$script" "$@"
   fi
   say_err "请用 root 运行：sudo sh install.sh"
   exit 1
@@ -1662,8 +1918,10 @@ main() {
   fi
 
   umask 022
+  ORIG_PATH=$PATH
   PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
   export PATH
+  : "${SHORTCUT_NEW:=0}"
   NEED_REBOOT=0
   REBOOT_KERNEL=""
   ALLOW_VALUE=""
@@ -1687,6 +1945,7 @@ main() {
     on)
       need_root "$@"
       make_workdir
+      sync_installed_script "$@"
       printf '%s\n' "BBR 一键脚本 $VERSION"
       say_info "先认出这台机器是公网还是 NAT、是自己的内核还是切出来的，再补缺少的组件，然后打开 BBR。"
       cmd_on

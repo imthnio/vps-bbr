@@ -50,6 +50,21 @@ expect_fail "el7 < 4.9" version_ge 3.10.0-1160.el7.x86_64 4.9
 expect_ok "6.14 >= 4.9" version_ge 6.14.0-35-generic 4.9
 expect_ok "10 >= 9" version_ge 10.0 9.9
 expect_fail "empty kernel" version_ge linux 4.9
+expect_fail "same version" version_newer 1.1.0 1.1.0
+expect_ok "newer patch" version_newer 1.1.1 1.1.0
+expect_fail "older version" version_newer 1.0.0 1.1.0
+expect_ok "newer minor" version_newer 1.10.0 1.9.0
+expect "keep same file" "$(installed_copy_action 1.1.0 1.1.0 1)" "keep"
+expect "replace older" "$(installed_copy_action 1.1.0 1.0.0 0)" "replace"
+expect "use newer installed" "$(installed_copy_action 1.0.0 1.1.0 0)" "use-installed"
+expect "replace same version other file" "$(installed_copy_action 1.1.0 1.1.0 0)" "replace"
+expect "replace unreadable version" "$(installed_copy_action 1.1.0 "" 0)" "replace"
+expect "stay on same remote" "$(remote_update_action 1.1.0 1.1.0)" "stay"
+expect "stay on older remote" "$(remote_update_action 1.1.0 1.0.0)" "stay"
+expect "update from remote" "$(remote_update_action 1.0.0 1.1.0)" "update"
+expect "stay without remote" "$(remote_update_action 1.1.0 "")" "stay"
+expect "path has local sbin" "$(shortcut_link_dir "/usr/local/sbin:/usr/sbin:/usr/bin")" ""
+expect "openwrt path" "$(shortcut_link_dir "/usr/sbin:/usr/bin:/sbin:/bin")" "/usr/sbin"
 expect "kernel numeric" "$(kernel_numeric 6.14.0-35-generic)" "6.14.0"
 expect_ok "no local kernel files" kernel_ship_bbr 9.9.9-no-such-kernel-bbrtest
 
@@ -82,6 +97,8 @@ expect "kvm own" "$(classify_virt "" kvm)" "0 kvm"
 expect "bare" "$(classify_virt "" "")" "0 none"
 expect "docker" "$(classify_virt docker "")" "1 docker"
 expect "lxc" "$(classify_virt lxc "")" "1 lxc"
+expect "incus shared" "$(classify_virt incus "")" "1 incus"
+expect "proot shared" "$(classify_virt proot kvm)" "1 proot"
 
 phrase=$(virt_phrase 1 openvz)
 printf '%s\n' "$phrase" | grep -q '共用内核' && ok=$((ok + 1)) || {
@@ -180,6 +197,24 @@ expect "persist both" "$block" "net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr"
 block=$(persist_lines 0 1 "")
 expect "persist bbr only" "$block" "net.ipv4.tcp_congestion_control=bbr"
+
+printf '%s\n' 'No package kernel available.' 'Error: Nothing to do' > "$tmp/rpm-missing.txt"
+expect "rpm missing beats nothing" "$(rpm_log_kind "$tmp/rpm-missing.txt" 1)" "missing"
+printf '%s\n' 'Nothing to do' > "$tmp/rpm-nothing.txt"
+expect "rpm nothing is ok" "$(rpm_log_kind "$tmp/rpm-nothing.txt" 1)" "ok"
+expect "rpm rc 0 is ok" "$(rpm_log_kind "$tmp/rpm-missing.txt" 0)" "ok"
+printf '%s\n' 'Error: disk full' > "$tmp/rpm-fail.txt"
+expect "rpm other failure" "$(rpm_log_kind "$tmp/rpm-fail.txt" 1)" "failed"
+
+printf '%s\n' '#!/bin/sh' 'echo hi' > "$tmp/not-bbr.sh"
+expect_fail "reject random script" remote_script_ok "$tmp/not-bbr.sh"
+expect_ok "this file is a script" remote_script_ok ./install.sh
+expect "version of this file" "$(version_from_file ./install.sh)" "1.1.0"
+
+printf '%s\n' '#!/bin/sh' 'VERSION=9.9.9' > "$tmp/placed-src.sh"
+place_script "$tmp/placed-src.sh" "$tmp/placed-dest.sh"
+expect "placed version" "$(version_from_file "$tmp/placed-dest.sh")" "9.9.9"
+expect_ok "placed is executable" test -x "$tmp/placed-dest.sh"
 
 help_out=$(sh ./install.sh --help 2>&1)
 printf '%s\n' "$help_out" | grep -q '自动识别' && ok=$((ok + 1)) || {
